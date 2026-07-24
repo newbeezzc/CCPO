@@ -675,15 +675,15 @@ class DPOTrainer:
             mutation_rate_decay = 1.0
 
         while not done:
-            # action_idx, action_lr, log_prob = self.agent.select_action(state, deterministic, mutation_rate)
-            action_lr = 0.001
+            action_idx, action_lr, log_prob = self.agent.select_action(state, deterministic, mutation_rate)
+            # action_lr = 0.001
             next_state, reward, done, info = env.step(action_lr, deterministic)
 
-            # if not deterministic:
-            #     self.agent.store_transition(
-            #         state, action_idx, action_lr, log_prob, reward, done,
-            #         extra_info=info  # 携带 raw_delta_acc 等字段
-            #     )
+            if not deterministic:
+                self.agent.store_transition(
+                    state, action_idx, action_lr, log_prob, reward, done,
+                    extra_info=info  # 携带 raw_delta_acc 等字段
+                )
 
             episode_reward += reward
             episode_length += 1

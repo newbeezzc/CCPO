@@ -209,7 +209,8 @@ def _load_uba_models():
     return None, None, None
 
 
-_uba_get_model, _uba_SimpleCNN, _UBA_SRC = _load_uba_models()
+# _uba_get_model, _uba_SimpleCNN, _UBA_SRC = _load_uba_models()
+_uba_get_model, _uba_SimpleCNN, _UBA_SRC = None, None, None  # 临时禁用 UBA 导入，避免依赖冲突
 
 if _uba_get_model is not None:
     # 直接复用源项目定义（自动同步 vision 的网络结构改动）

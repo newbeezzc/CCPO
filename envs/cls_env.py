@@ -413,8 +413,7 @@ class ClsEnv:
         progress = curr_state['progress']
         time_weight = np.exp(self.reward_time_decay * (progress - 1.0))
         reward = delta_acc * time_weight
-        #return reward, current_acc, delta_acc
-        return delta_acc, current_acc, delta_acc
+        return reward, current_acc, delta_acc
 
     # ------------------------------------------------------------------
     # 查询接口

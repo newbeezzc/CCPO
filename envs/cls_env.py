@@ -79,10 +79,12 @@ class ClsEnv:
     """
 
     def __init__(self, args, flag: str = 'train', device: str = 'cuda',
-                 epochs_by_dataset: Optional[Dict[str, int]] = None):
+                 epochs_by_dataset: Optional[Dict[str, int]] = None,
+                 gpu_ids: Optional[List[int]] = None):
         self.args = args
         self.device = device
         self.flag = flag  # 'train' 或 'test'
+        self.gpu_ids = gpu_ids or []  # 多卡 DataParallel 用
         # 逐数据集 epochs 覆盖（跨上下文最终评估用；未列出的数据集回退到 self.epochs）
         self.epochs_by_dataset = dict(epochs_by_dataset or {})
 
@@ -208,9 +210,13 @@ class ClsEnv:
         self.base_train_ds, self.base_test_ds = self._ds_cache[key]
 
     def _create_model(self):
-        return get_model(self.arch, self.num_classes,
-                         cifar_stem=self.cifar_stem,
-                         in_channels=self.in_channels).to(self.device)
+        model = get_model(self.arch, self.num_classes,
+                          cifar_stem=self.cifar_stem,
+                          in_channels=self.in_channels).to(self.device)
+        # 多卡并行：DataParallel 透明包装，forward/backward/optimizer 自动分发
+        if len(self.gpu_ids) > 1:
+            model = nn.DataParallel(model, device_ids=self.gpu_ids)
+        return model
 
     def _create_optimizer(self, model, lr: float):
         if self.optimizer_name == 'adamw':
@@ -466,11 +472,13 @@ class MultiTaskClsEnv:
     """多任务图像分类环境（管理多个 seed/split 任务，支持任务采样）。"""
 
     def __init__(self, args, task_list: List[str] = None, flag: str = 'train',
-                 device: str = 'cuda', epochs_by_dataset: Optional[Dict[str, int]] = None):
+                 device: str = 'cuda', epochs_by_dataset: Optional[Dict[str, int]] = None,
+                 gpu_ids: Optional[List[int]] = None):
         self.args = args
         self.task_list = task_list or []
         self.device = device
-        self.env = ClsEnv(args, flag, device, epochs_by_dataset=epochs_by_dataset)
+        self.env = ClsEnv(args, flag, device, epochs_by_dataset=epochs_by_dataset,
+                          gpu_ids=gpu_ids)
         self.current_task = None
 
     def sample_task(self) -> str:

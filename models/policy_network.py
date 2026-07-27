@@ -280,7 +280,7 @@ def load_policy(checkpoint_path: str,
 
     # 加载checkpoint
     if os.path.exists(checkpoint_path):
-        state_dict = torch.load(checkpoint_path, map_location='cpu')
+        state_dict = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         model.load_state_dict(state_dict)
         print(f"Loaded policy checkpoint from {checkpoint_path}")
     else:

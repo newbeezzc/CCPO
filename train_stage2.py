@@ -57,7 +57,7 @@ def main():
     print("=" * 60)
     print("Meta-Schedule Stage 2: Preference Learning (DPO) LR Scheduling")
     print("=" * 60)
-    print(f"Device: {device}")
+    print(f"Device: {device}  (GPUs: {gpu_ids if gpu_ids else 'single'})")
     print(f"Output directory: {args.output_dir}")
     print(f"Training tasks: {args.train_tasks}")
     print(f"Test tasks (periodic eval / best-model): {args.test_tasks}")
@@ -75,7 +75,8 @@ def main():
         args=args,
         task_list=args.train_tasks,
         flag='train',
-        device=str(device)
+        device=str(device),
+        gpu_ids=gpu_ids,
     )
     print(f"Training environment created with {train_env.num_tasks} tasks")
 
@@ -86,7 +87,8 @@ def main():
         args=test_args,
         task_list=args.test_tasks,
         flag='test',
-        device=str(device)
+        device=str(device),
+        gpu_ids=gpu_ids,
     )
     print(f"Test environment created with {test_env.num_tasks} tasks")
 
@@ -103,6 +105,7 @@ def main():
         flag='test',
         device=str(device),
         epochs_by_dataset=final_epochs_map,
+        gpu_ids=gpu_ids,
     )
     print(f"Final-eval environment created with {final_eval_env.num_tasks} "
           f"cross-context tasks: {args.final_eval_tasks}")

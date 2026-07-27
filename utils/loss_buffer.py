@@ -1,6 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 损失序列缓冲区：管理滑动窗口的损失序列
+
+支持两种归一化模式：
+  - 'window': 窗口内 z-score 归一化 —— 每个窗口以自身均值和标准差为基准，
+              Policy 只看到"曲线形状"（下降/震荡/平台），跨任务泛化强，
+              绝对 loss 水平由 context_features（原始值）和 progress 提供。
+  - 'initial': 初始 loss 归一化 —— 以 warmup 结束时的 loss 为分母，
+               loss_rel = raw_loss / ref_loss，Policy 能同时看到形状和尺度，
+               "0.5" 在所有任务上语义一致（"loss 降了一半"）。
 """
 
 import torch
@@ -12,41 +20,48 @@ from typing import Tuple, Optional
 class LossBuffer:
     """
     损失序列缓冲区，维护最近W步的多通道损失值
-    
+
     用于构建RL状态中的损失曲线窗口 X_t ∈ R^{W×d}
     """
-    
-    def __init__(self, window_size: int, num_channels: int, device: str = 'cuda'):
+
+    def __init__(self, window_size: int, num_channels: int,
+                 normalization: str = 'initial', device: str = 'cuda'):
         """
         Args:
             window_size: 窗口大小 W
             num_channels: 损失通道数 d
+            normalization: 归一化模式 'window' | 'initial'
             device: 设备
         """
         self.window_size = window_size
         self.num_channels = num_channels
+        self.normalization = normalization  # 'window' or 'initial'
         self.device = device
-        
-        # 使用deque实现高效的滑动窗口
+
         self.buffer = deque(maxlen=window_size)
-        
-        # 用于归一化的统计量（running statistics）
-        self.running_mean = torch.zeros(num_channels, device=device)
-        self.running_var = torch.ones(num_channels, device=device)
-        self.count = 0
-        self.momentum = 0.01  # 指数移动平均的动量
-        
+
+        # ---- 'initial' 模式：固定参考 loss（warmup 结束后设定） ----
+        self.ref_loss: Optional[torch.Tensor] = None  # [d]  per-channel ref
+
     def reset(self):
-        """重置缓冲区"""
+        """重置缓冲区（不重置 ref_loss——外部需要重新 warmup 来设定新的 ref_loss）。"""
         self.buffer.clear()
-        self.running_mean = torch.zeros(self.num_channels, device=self.device)
-        self.running_var = torch.ones(self.num_channels, device=self.device)
-        self.count = 0
-        
+        self.ref_loss = None
+
+    def set_ref_loss(self):
+        """用当前 buffer 中所有数据的均值作为参考 loss（'initial' 模式专用）。
+
+        调用时机：warmup 结束后立即调用，此后 ref_loss 固定不变。
+        """
+        if len(self.buffer) == 0:
+            raise RuntimeError("LossBuffer.set_ref_loss(): buffer is empty, cannot set ref_loss.")
+        raw = torch.stack(list(self.buffer), dim=0)  # [N, d]
+        self.ref_loss = raw.mean(dim=0).clamp(min=1e-8)  # [d]
+
     def push(self, losses: torch.Tensor):
         """
         添加一步的损失值
-        
+
         Args:
             losses: [d] 当前步的多通道损失值
         """
@@ -54,84 +69,78 @@ class LossBuffer:
             losses = torch.tensor(losses, device=self.device, dtype=torch.float32)
         else:
             losses = losses.to(self.device).float()
-            
-        # 更新running statistics
-        self.count += 1
-        delta = losses - self.running_mean
-        self.running_mean += self.momentum * delta
-        self.running_var = (1 - self.momentum) * self.running_var + self.momentum * (delta ** 2)
-        
+
         self.buffer.append(losses)
-        
+
     def is_ready(self) -> bool:
         """检查缓冲区是否已填满"""
         return len(self.buffer) >= self.window_size
-    
+
     def get_window(self, normalize: bool = True) -> torch.Tensor:
         """
         获取当前的损失窗口
-        
+
         Args:
             normalize: 是否进行归一化
-            
+
         Returns:
             window: [W, d] 损失曲线窗口
         """
         if not self.is_ready():
-            # 如果缓冲区未满，用零填充前面的部分
             padding_size = self.window_size - len(self.buffer)
             if len(self.buffer) > 0:
                 first_loss = self.buffer[0]
                 padding = [first_loss.clone() for _ in range(padding_size)]
                 window_list = padding + list(self.buffer)
             else:
-                window_list = [torch.zeros(self.num_channels, device=self.device) 
+                window_list = [torch.zeros(self.num_channels, device=self.device)
                               for _ in range(self.window_size)]
         else:
             window_list = list(self.buffer)
-            
+
         window = torch.stack(window_list, dim=0)  # [W, d]
-        
+
         if normalize:
-            # 使用running statistics进行归一化
-            window = (window - self.running_mean) / (torch.sqrt(self.running_var) + 1e-8)
-            
+            if self.normalization == 'initial':
+                if self.ref_loss is None:
+                    raise RuntimeError(
+                        "LossBuffer: normalization='initial' but ref_loss not set. "
+                        "Call set_ref_loss() after warmup.")
+                window = window / self.ref_loss.clamp(min=1e-8)
+            elif self.normalization == 'window':
+                # 窗口内实例 z-score 归一化
+                mean = window.mean(dim=0, keepdim=True)   # [1, d]
+                std = window.std(dim=0, keepdim=True)      # [1, d]
+                window = (window - mean) / (std + 1e-8)
+
         return window
-    
+
     def get_context_features(self) -> torch.Tensor:
         """
-        计算序列统计特征（用于上下文融合层）
-        
+        计算序列统计特征（用于上下文融合层）。
+        始终基于原始值（非归一化）计算，保证绝对尺度信息不丢失。
+
         Returns:
             context: [4 * d] 包含 mean, std, trend, last 四种统计量
         """
         window = self.get_window(normalize=False)  # [W, d]
-        
-        # 1. 均值
-        mean = window.mean(dim=0)  # [d]
-        
-        # 2. 标准差
-        std = window.std(dim=0)  # [d]
-        
-        # 3. 趋势（线性回归斜率的近似：最后一半均值 - 前一半均值）
+
+        mean = window.mean(dim=0)                        # [d]
+        std = window.std(dim=0)                          # [d]
         half = self.window_size // 2
         trend = window[half:].mean(dim=0) - window[:half].mean(dim=0)  # [d]
-        
-        # 4. 最后一个值
-        last = window[-1]  # [d]
-        
-        # 拼接
+        last = window[-1]                                # [d]
+
         context = torch.cat([mean, std, trend, last], dim=0)  # [4*d]
-        
         return context
-    
+
     def get_state_components(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         获取状态的损失相关组件
-        
+
         Returns:
             window: [W, d] 归一化后的损失窗口
-            context: [4*d] 上下文特征
+            context: [4*d] 上下文特征（原始值统计量）
         """
         window = self.get_window(normalize=True)
         context = self.get_context_features()

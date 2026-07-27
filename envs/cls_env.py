@@ -10,11 +10,7 @@ CCPO 策略网络通过观测训练动态（多通道损失曲线）调整学习
   - 去掉所有 UDA 逻辑（对抗损失 / MMD / 伪标签 / 混淆矩阵）
   - "任务" 由随机种子 + 训练数据子集划分定义（同一 CIFAR-10 的不同 seed/split），
     为元学习提供任务多样性
-  - loss_window 的 4 个通道改为 "每步训练统计量"：
-        Ch0: 原始 batch 交叉熵损失
-        Ch1: EMA 平滑损失
-        Ch2: batch 训练准确率
-        Ch3: 梯度 L2 范数
+  - loss_window 为单通道：仅 raw batch 交叉熵损失
 CCPO 的奖励（时间感知 Δacc）、DPO、偏好缓冲区等逻辑保持不变。
 
 接口与 UDAEnv / MultiTaskUDAEnv 完全一致（reset / step / get_episode_info /
@@ -90,7 +86,8 @@ class ClsEnv:
 
         # ---- 环境参数 ----
         self.window_size = args.loss_window          # W
-        self.num_channels = args.loss_channels        # d（分类内循环固定为 4）
+        self.num_channels = args.loss_channels        # d（分类内循环：仅 raw CE loss）
+        self.loss_norm = getattr(args, 'loss_norm', 'initial')  # 归一化模式
         self.adjust_interval = args.adjust_interval   # 每 N 步干预一次
         self.warmup_steps = args.warmup_steps
         self.lr_min = args.lr_min
@@ -135,7 +132,6 @@ class ClsEnv:
         self.train_iter = None
         self.val_loader = None
         self.loss_buffer = None
-        self.ema_loss = None
 
         self.total_steps = 0
         self.steps_per_epoch = 0
@@ -264,9 +260,9 @@ class ClsEnv:
         self.loss_buffer = LossBuffer(
             window_size=self.window_size,
             num_channels=self.num_channels,
-            device='cpu'
+            normalization=self.loss_norm,
+            device='cpu',
         )
-        self.ema_loss = None
 
         # 计数器 / 历史
         self.current_step = 0
@@ -293,6 +289,12 @@ class ClsEnv:
             self.current_step += 1
             self.loss_history.append(losses.cpu().numpy())
 
+        # 'initial' 模式：用 warmup 窗口均值作为归一化分母
+        if self.loss_norm == 'initial':
+            self.loss_buffer.set_ref_loss()
+            ref = self.loss_buffer.ref_loss.cpu().numpy()
+            print(f"Warmup ref_loss: {ref}")
+
         self.prev_acc = self._evaluate()
         print(f"Warmup completed. Initial accuracy: {self.prev_acc:.2f}%")
         self.acc_history.append(self.prev_acc)
@@ -301,10 +303,7 @@ class ClsEnv:
     # 训练 / 评估
     # ------------------------------------------------------------------
     def _train_one_step(self) -> torch.Tensor:
-        """执行一步分类训练，返回 [d] 多通道训练统计。
-
-        通道: [raw CE loss, EMA loss, batch acc, grad L2-norm]
-        """
+        """执行一步分类训练，返回 [1] 单通道统计量（raw CE loss）。"""
         self.model.train()
         x, labels = next(self.train_iter)
         x = x.to(self.device, non_blocking=True)
@@ -315,34 +314,9 @@ class ClsEnv:
 
         self.optimizer.zero_grad()
         loss.backward()
-
-        # 梯度 L2 范数（在 step 之前统计）
-        grad_norm_sq = 0.0
-        for p in self.model.parameters():
-            if p.grad is not None:
-                grad_norm_sq += float(p.grad.detach().pow(2).sum().item())
-        grad_norm = float(np.sqrt(grad_norm_sq))
-
         self.optimizer.step()
 
-        # batch 训练准确率
-        with torch.no_grad():
-            batch_acc = (logits.argmax(dim=1) == labels).float().mean().item()
-
-        # EMA 平滑损失
-        raw_loss = float(loss.item())
-        if self.ema_loss is None:
-            self.ema_loss = raw_loss
-        else:
-            self.ema_loss = 0.9 * self.ema_loss + 0.1 * raw_loss
-
-        losses = torch.tensor([
-            raw_loss,
-            self.ema_loss,
-            batch_acc,
-            grad_norm,
-        ], device=self.device, dtype=torch.float32)
-        return losses
+        return torch.tensor([float(loss.item())], device=self.device, dtype=torch.float32)
 
     def _train_n_steps(self, n: int) -> List[torch.Tensor]:
         losses_list = []

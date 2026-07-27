@@ -68,8 +68,11 @@ def get_default_config():
                         help='一阶段评价模型 checkpoint（分类任务可留空，编码器随机初始化）')
     parser.add_argument('--loss_window', type=int, default=100,
                         help='损失曲线窗口大小 W')
-    parser.add_argument('--loss_channels', type=int, default=4,
-                        help='损失通道数 d（分类内循环固定为 4）')
+    parser.add_argument('--loss_channels', type=int, default=1,
+                        help='损失通道数 d（分类内循环：仅 raw CE loss）')
+    parser.add_argument('--loss_norm', type=str, default='initial',
+                        choices=['window', 'initial'],
+                        help='loss 归一化模式: window=窗口内z-score, initial=除以warmup结束时的loss')
     parser.add_argument('--freeze_encoder', action='store_true', default=False,
                         help='是否冻结复用的时序编码器')
     parser.add_argument('--hidden_dim', type=int, default=256, help='策略网络隐藏层维度')

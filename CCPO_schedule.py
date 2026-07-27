@@ -36,7 +36,7 @@ class CCPOSchedule(_LRScheduler):
     CCPO 策略驱动的学习率调度器。
 
     继承 _LRScheduler，遵循 PyTorch 标准调度器接口，同时新增 update_stats()
-    方法供训练循环在每 batch 后喂入训练统计量。
+    方法供训练循环在每 batch 后喂入 raw loss。
 
     Parameters
     ----------
@@ -60,7 +60,9 @@ class CCPOSchedule(_LRScheduler):
     loss_window : int
         损失窗口大小 W（需与 CCPO 训练时的 --loss_window 一致，默认 100）。
     loss_channels : int
-        损失通道数 d（固定为 4：raw loss / EMA loss / batch acc / grad norm）。
+        损失通道数 d（默认 1：仅 raw CE loss）。
+    loss_norm : str
+        loss 归一化模式: 'window' 窗口内z-score | 'initial' 除以warmup结束时的loss（默认）。
     embed_dim : int
         策略网络嵌入维度（需与 CCPO 训练时一致，默认 128）。
     hidden_dim : int
@@ -84,7 +86,8 @@ class CCPOSchedule(_LRScheduler):
         lr_min: float = 1e-5,
         lr_max: float = 1e-2,
         loss_window: int = 100,
-        loss_channels: int = 4,
+        loss_channels: int = 1,
+        loss_norm: str = "initial",
         embed_dim: int = 128,
         hidden_dim: int = 256,
         device: str = "cuda",
@@ -100,19 +103,21 @@ class CCPOSchedule(_LRScheduler):
         self.lr_max = float(lr_max)
         self.loss_window = int(loss_window)
         self.loss_channels = int(loss_channels)
+        self.loss_norm = str(loss_norm)
         self.device = device
         self._verbose = verbose
 
         # ---- load CCPO policy network (frozen) ----
         self._load_policy(checkpoint_path, embed_dim, hidden_dim)
 
-        # ---- internal loss buffer (4-channel stats + EMA, consistent with ClsEnv) ----
+        # ---- internal loss buffer (single-channel: raw CE loss) ----
         self.loss_buffer = LossBuffer(
             window_size=self.loss_window,
             num_channels=self.loss_channels,
+            normalization=self.loss_norm,
             device="cpu",
         )
-        self._ema_loss: Optional[float] = None
+        self._warmup_ref_set = False  # 是否已在 warmup 结束后设定了 ref_loss
 
         # ---- internal state ----
         self._current_lr: float = self.init_lr
@@ -129,6 +134,8 @@ class CCPOSchedule(_LRScheduler):
               f"total={self.total_steps}")
         print(f"  init_lr={self.init_lr:.2e}, lr_range=[{self.lr_min:.2e}, "
               f"{self.lr_max:.2e}]")
+        print(f"  loss_norm={self.loss_norm}, loss_channels={self.loss_channels}, "
+              f"loss_window={self.loss_window}")
         print(f"  device={self.device}  verbose={self._verbose}")
 
     # ==================================================================
@@ -184,7 +191,7 @@ class CCPOSchedule(_LRScheduler):
     # Core API: update_stats() -- feed training stats per batch
     # ==================================================================
 
-    def update_stats(self, raw_loss: float, batch_acc: float, grad_norm: float):
+    def update_stats(self, raw_loss: float):
         """
         Call after every batch to push training statistics into the internal LossBuffer.
 
@@ -194,28 +201,10 @@ class CCPOSchedule(_LRScheduler):
         Parameters
         ----------
         raw_loss : float
-            Raw CE loss of the current batch (un-smoothed).
-        batch_acc : float
-            Training accuracy of the current batch, in [0, 1].
-        grad_norm : float
-            Gradient L2 norm (must be computed BEFORE optimizer.step(),
-            since step() modifies/clears .grad).
+            Raw CE loss of the current batch.
         """
-        # EMA-smoothed loss (alpha=0.9, identical to ClsEnv._train_one_step)
-        if self._ema_loss is None:
-            self._ema_loss = float(raw_loss)
-        else:
-            self._ema_loss = 0.9 * self._ema_loss + 0.1 * float(raw_loss)
-
-        # 4-channel stats: [raw_loss, ema_loss, batch_acc, grad_norm]
-        losses = torch.tensor([
-            float(raw_loss),
-            self._ema_loss,
-            float(batch_acc),
-            float(grad_norm),
-        ], dtype=torch.float32)
-
-        self.loss_buffer.push(losses)
+        self.loss_buffer.push(
+            torch.tensor([float(raw_loss)], dtype=torch.float32))
 
     # ==================================================================
     # _LRScheduler entry: get_lr()
@@ -232,6 +221,14 @@ class CCPOSchedule(_LRScheduler):
         # ---- warmup: constant init_lr, no policy query ----
         if t < self.warmup_steps:
             return [self._current_lr for _ in self.base_lrs]
+
+        # ---- warmup → scheduling transition: auto-set ref_loss for 'initial' mode ----
+        if self.loss_norm == 'initial' and not self._warmup_ref_set:
+            self._warmup_ref_set = True
+            if self.loss_buffer.is_ready():
+                self.loss_buffer.set_ref_loss()
+                ref = self.loss_buffer.ref_loss.item()
+                print(f"[CCPOSchedule] Warmup complete, ref_loss = {ref:.4f}")
 
         # ---- scheduling: check if this step triggers a policy query ----
         effective_step = t - self.warmup_steps
@@ -302,15 +299,15 @@ class CCPOSchedule(_LRScheduler):
     # ==================================================================
 
     def reset(self):
-        """Reset internal state (LossBuffer / EMA / LR) for a new training run.
+        """Reset internal state (LossBuffer / LR) for a new training run.
 
         Note: does NOT reload policy weights; only clears runtime statistics.
         """
         self.loss_buffer.reset()
-        self._ema_loss = None
+        self._warmup_ref_set = False
         self._current_lr = self.init_lr
         if self._verbose:
-            print("[CCPOSchedule] State reset (buffer/EMA/LR cleared)")
+            print("[CCPOSchedule] State reset (buffer/LR cleared)")
 
     def current_lr(self) -> float:
         """Return the currently active learning rate."""
@@ -351,7 +348,8 @@ def create_ccpo_schedule(
     lr_min: float = 1e-5,
     lr_max: float = 1e-2,
     loss_window: int = 100,
-    loss_channels: int = 4,
+    loss_channels: int = 1,
+    loss_norm: str = "initial",
     embed_dim: int = 128,
     hidden_dim: int = 256,
     device: str = "cuda",
@@ -379,7 +377,9 @@ def create_ccpo_schedule(
     loss_window : int
         损失窗口大小 W。
     loss_channels : int
-        损失通道数 d。
+        损失通道数 d（默认 1：仅 raw loss）。
+    loss_norm : str
+        归一化模式 'window' | 'initial'（默认 'initial'）。
     embed_dim, hidden_dim : int
         策略网络架构参数。
     device : str
@@ -403,6 +403,7 @@ def create_ccpo_schedule(
         lr_max=lr_max,
         loss_window=loss_window,
         loss_channels=loss_channels,
+        loss_norm=loss_norm,
         embed_dim=embed_dim,
         hidden_dim=hidden_dim,
         device=device,

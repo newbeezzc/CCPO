@@ -196,9 +196,9 @@ class PolicyNetwork(nn.Module):
             现在经过 prediction_head 得到 logits: [B, num_actions]，
             再用 Softmax 得到概率，argmax 得到离散动作，并映射回 ACTION_SET 中的具体数值。
         """
-        progress = torch.zeros_like(progress)
-        lr = torch.zeros_like(lr)
-        context_features = torch.zeros_like(context_features)
+        # progress = torch.zeros_like(progress)
+        # lr = torch.zeros_like(lr)
+        # context_features = torch.zeros_like(context_features)
 
         # (1) 时序编码器
         z = self.encode(x_enc)

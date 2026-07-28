@@ -63,6 +63,8 @@ class CCPOSchedule(_LRScheduler):
         损失通道数 d（默认 1：仅 raw CE loss）。
     loss_norm : str
         loss 归一化模式: 'window' 窗口内z-score | 'initial' 除以warmup结束时的loss（默认）。
+    encoder_type : str
+        时序编码器类型: 'frets' 频域MLP | 'gru' 2层GRU（需与训练时一致，默认 'frets'）。
     embed_dim : int
         策略网络嵌入维度（需与 CCPO 训练时一致，默认 128）。
     hidden_dim : int
@@ -88,6 +90,7 @@ class CCPOSchedule(_LRScheduler):
         loss_window: int = 100,
         loss_channels: int = 1,
         loss_norm: str = "initial",
+        encoder_type: str = "frets",
         embed_dim: int = 128,
         hidden_dim: int = 256,
         device: str = "cuda",
@@ -104,6 +107,7 @@ class CCPOSchedule(_LRScheduler):
         self.loss_window = int(loss_window)
         self.loss_channels = int(loss_channels)
         self.loss_norm = str(loss_norm)
+        self.encoder_type = str(encoder_type)
         self.device = device
         self._verbose = verbose
 
@@ -136,6 +140,7 @@ class CCPOSchedule(_LRScheduler):
               f"{self.lr_max:.2e}]")
         print(f"  loss_norm={self.loss_norm}, loss_channels={self.loss_channels}, "
               f"loss_window={self.loss_window}")
+        print(f"  encoder_type={self.encoder_type}")
         print(f"  device={self.device}  verbose={self._verbose}")
 
     # ==================================================================
@@ -149,6 +154,7 @@ class CCPOSchedule(_LRScheduler):
             enc_in=self.loss_channels,
             embed_size=embed_dim,
             hidden_size=hidden_dim,
+            encoder_type=self.encoder_type,
         )
         self.policy = PolicyNetwork(config).to(self.device)
 
@@ -350,6 +356,7 @@ def create_ccpo_schedule(
     loss_window: int = 100,
     loss_channels: int = 1,
     loss_norm: str = "initial",
+    encoder_type: str = "frets",
     embed_dim: int = 128,
     hidden_dim: int = 256,
     device: str = "cuda",
@@ -380,6 +387,8 @@ def create_ccpo_schedule(
         损失通道数 d（默认 1：仅 raw loss）。
     loss_norm : str
         归一化模式 'window' | 'initial'（默认 'initial'）。
+    encoder_type : str
+        编码器类型 'frets' | 'gru'（默认 'frets'）。
     embed_dim, hidden_dim : int
         策略网络架构参数。
     device : str
@@ -404,6 +413,7 @@ def create_ccpo_schedule(
         loss_window=loss_window,
         loss_channels=loss_channels,
         loss_norm=loss_norm,
+        encoder_type=encoder_type,
         embed_dim=embed_dim,
         hidden_dim=hidden_dim,
         device=device,

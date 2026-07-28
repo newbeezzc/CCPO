@@ -268,7 +268,8 @@ class DPOAgent:
             seq_len=args.loss_window,
             enc_in=args.loss_channels,
             embed_size=args.embed_dim,
-            hidden_size=args.hidden_dim
+            hidden_size=args.hidden_dim,
+            encoder_type=getattr(args, 'encoder_type', 'frets'),
         )
         self.policy = load_policy(
             args.evaluator_ckpt,

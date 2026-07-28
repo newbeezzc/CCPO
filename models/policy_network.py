@@ -46,7 +46,8 @@ class PolicyConfig:
                  hidden_size: int = 256,  # 隐藏层维度
                  channel_independence: str = '0',
                  task_name: str = 'classification',
-                 pred_len: int = 1):
+                 pred_len: int = 1,
+                 encoder_type: str = 'frets'):  # 'frets' | 'gru'
         self.seq_len = seq_len
         self.enc_in = enc_in
         self.embed_size = embed_size
@@ -54,6 +55,7 @@ class PolicyConfig:
         self.channel_independence = channel_independence
         self.task_name = task_name
         self.pred_len = pred_len
+        self.encoder_type = encoder_type
 
 
 class PolicyNetwork(nn.Module):
@@ -82,6 +84,7 @@ class PolicyNetwork(nn.Module):
         self.feature_size = configs.enc_in  # num_features (损失类型数)
         self.seq_len = configs.seq_len
         self.channel_independence = configs.channel_independence
+        self.encoder_type = getattr(configs, 'encoder_type', 'frets')
         self.sparsity_threshold = 0.01
         self.scale = 0.02
 
@@ -96,22 +99,36 @@ class PolicyNetwork(nn.Module):
         )
         # ====================================================================
 
-        # ============ (1) 时序编码器: FreTS ============
-        self.embeddings = nn.Parameter(torch.randn(1, self.embed_size))
-        self.r1 = nn.Parameter(self.scale * torch.randn(self.embed_size, self.embed_size))
-        self.i1 = nn.Parameter(self.scale * torch.randn(self.embed_size, self.embed_size))
-        self.rb1 = nn.Parameter(self.scale * torch.randn(self.embed_size))
-        self.ib1 = nn.Parameter(self.scale * torch.randn(self.embed_size))
-        self.r2 = nn.Parameter(self.scale * torch.randn(self.embed_size, self.embed_size))
-        self.i2 = nn.Parameter(self.scale * torch.randn(self.embed_size, self.embed_size))
-        self.rb2 = nn.Parameter(self.scale * torch.randn(self.embed_size))
-        self.ib2 = nn.Parameter(self.scale * torch.randn(self.embed_size))
+        # ============ (1) 时序编码器 ============
+        if self.encoder_type == 'frets':
+            # ---- FreTS: 频域 MLP ----
+            self.embeddings = nn.Parameter(torch.randn(1, self.embed_size))
+            self.r1 = nn.Parameter(self.scale * torch.randn(self.embed_size, self.embed_size))
+            self.i1 = nn.Parameter(self.scale * torch.randn(self.embed_size, self.embed_size))
+            self.rb1 = nn.Parameter(self.scale * torch.randn(self.embed_size))
+            self.ib1 = nn.Parameter(self.scale * torch.randn(self.embed_size))
+            self.r2 = nn.Parameter(self.scale * torch.randn(self.embed_size, self.embed_size))
+            self.i2 = nn.Parameter(self.scale * torch.randn(self.embed_size, self.embed_size))
+            self.rb2 = nn.Parameter(self.scale * torch.randn(self.embed_size))
+            self.ib2 = nn.Parameter(self.scale * torch.randn(self.embed_size))
 
-        self.temporal_proj = nn.Sequential(
-            nn.Linear(self.seq_len * self.embed_size * self.feature_size, self.hidden_size),
-            nn.GELU(),
-            nn.Linear(self.hidden_size, self.embed_size)
-        )
+            self.temporal_proj = nn.Sequential(
+                nn.Linear(self.seq_len * self.embed_size * self.feature_size, self.hidden_size),
+                nn.GELU(),
+                nn.Linear(self.hidden_size, self.embed_size)
+            )
+        elif self.encoder_type == 'gru':
+            # ---- GRU: 2-layer recurrent encoder ----
+            self.gru_input_proj = nn.Linear(self.feature_size, self.embed_size)
+            self.gru = nn.GRU(
+                input_size=self.embed_size,
+                hidden_size=self.embed_size,
+                num_layers=2,
+                batch_first=True,
+                dropout=0.1,
+            )
+        else:
+            raise ValueError(f"Unknown encoder_type: {self.encoder_type}")
 
         # ============ (2) 上下文融合层（修改） ============
         self.context_fusion = ContextFusionLayer(
@@ -168,6 +185,15 @@ class PolicyNetwork(nn.Module):
 
     def encode(self, x_enc):
         B, T, N = x_enc.shape
+        if self.encoder_type == 'frets':
+            return self._encode_frets(x_enc, B, T, N)
+        elif self.encoder_type == 'gru':
+            return self._encode_gru(x_enc)
+        else:
+            raise ValueError(f"Unknown encoder_type: {self.encoder_type}")
+
+    def _encode_frets(self, x_enc, B, T, N):
+        """FreTS 频域编码器: FFT → FreMLP → iFFT → temporal_proj."""
         x = self.tokenEmb(x_enc)
         bias = x
         if self.channel_independence == '0':
@@ -175,6 +201,13 @@ class PolicyNetwork(nn.Module):
         x = self.MLP_temporal(x, B, N, T)
         x = x + bias
         z = self.temporal_proj(x.reshape(B, -1))
+        return z
+
+    def _encode_gru(self, x_enc):
+        """GRU 编码器: Linear embed → 2-layer GRU → last hidden state."""
+        x = self.gru_input_proj(x_enc)       # [B, W, d] → [B, W, embed_dim]
+        _, h_n = self.gru(x)                  # h_n: [2, B, embed_dim]
+        z = h_n[-1]                            # [B, embed_dim] — final layer's last hidden
         return z
 
     def forward(self, x_enc, progress, lr, context_features):

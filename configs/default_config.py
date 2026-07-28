@@ -73,6 +73,9 @@ def get_default_config():
     parser.add_argument('--loss_norm', type=str, default='initial',
                         choices=['window', 'initial'],
                         help='loss 归一化模式: window=窗口内z-score, initial=除以warmup结束时的loss')
+    parser.add_argument('--encoder_type', type=str, default='frets',
+                        choices=['frets', 'gru'],
+                        help='时序编码器类型: frets=频域MLP, gru=2层GRU')
     parser.add_argument('--freeze_encoder', action='store_true', default=False,
                         help='是否冻结复用的时序编码器')
     parser.add_argument('--hidden_dim', type=int, default=256, help='策略网络隐藏层维度')
